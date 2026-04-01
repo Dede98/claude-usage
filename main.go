@@ -37,6 +37,8 @@ func main() {
 		runInstall(rest)
 	case "uninstall":
 		runUninstall()
+	case "guard":
+		runGuard(rest)
 	case "statusline":
 		runStatusline(rest)
 	default:
@@ -61,6 +63,10 @@ USAGE
   claude-usage install          Install statusline integration
   claude-usage install --daemon Also install background daemon
   claude-usage uninstall        Remove everything
+
+  claude-usage guard --pid PID         Watch process, pause at threshold
+  claude-usage guard --pid-file PATH   Watch PID from lock file
+  claude-usage guard status            Show current guard state
 
   claude-usage statusline              Output status bar segment
   claude-usage statusline --wrap CMD   Wrap existing statusline command
