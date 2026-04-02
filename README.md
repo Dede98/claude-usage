@@ -60,6 +60,33 @@ claude-usage --read       # Display from cached file (no API call)
 claude-usage --status     # One-line summary for scripting
 ```
 
+### Usage guard
+
+Watch a process and automatically pause it when rate limits get too high:
+
+```bash
+claude-usage guard --pid 12345                # Watch a specific PID
+claude-usage guard --pid-file .gsd/auto.lock  # Watch PID from lock file
+claude-usage guard status                     # Show current usage + guard state
+```
+
+The guard monitors both session (5h) and weekly (7d) limits, showing them side by side. When usage exceeds the threshold (default 80%), it sends SIGTERM to the watched process. When usage drops back down, it notifies you.
+
+```bash
+# Options
+claude-usage guard --pid-file .gsd/auto.lock \
+  --threshold 90      # Pause at 90% (default: 80)
+  --warn 80           # Warn at 80% (default: threshold - 10)
+  --poll 15           # Poll every 15s (default: 30)
+  --auto-resume       # Notify when safe to resume
+  --dry-run           # Log actions without killing
+  --quiet             # Suppress routine output
+```
+
+The display updates in place — routine polls overwrite the same line, only state changes (warnings, pauses) get their own timestamped line.
+
+Supports both plain PID files (`12345`) and JSON lock files (`{"pid": 12345}`) for compatibility with tools like GSD.
+
 ### Claude Code status bar
 
 The `install` command automatically configures your Claude Code status bar:
