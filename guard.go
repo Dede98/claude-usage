@@ -1,15 +1,23 @@
+//go:build darwin
+
 package main
 
 import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 )
+
+const clearLine = "\033[2K\r"
+const hideCursor = "\033[?25l"
+const showCursor = "\033[?25h"
 
 type guardConfig struct {
 	threshold  int
@@ -40,33 +48,47 @@ func parseGuardArgs(args []string) guardConfig {
 		stateFile: defaultStateFile(),
 	}
 
-	// Check for "status" subcommand
-	if len(args) > 0 && args[0] == "status" {
-		runGuardStatus(cfg)
-		os.Exit(0)
-	}
-
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--threshold":
 			if i+1 < len(args) {
 				i++
-				cfg.threshold, _ = strconv.Atoi(args[i])
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v < 1 || v > 100 {
+					fmt.Fprintf(os.Stderr, "Error: --threshold must be 1-100\n")
+					os.Exit(1)
+				}
+				cfg.threshold = v
 			}
 		case "--warn":
 			if i+1 < len(args) {
 				i++
-				cfg.warn, _ = strconv.Atoi(args[i])
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v < 0 || v > 100 {
+					fmt.Fprintf(os.Stderr, "Error: --warn must be 0-100\n")
+					os.Exit(1)
+				}
+				cfg.warn = v
 			}
 		case "--poll":
 			if i+1 < len(args) {
 				i++
-				cfg.poll, _ = strconv.Atoi(args[i])
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v < 1 {
+					fmt.Fprintf(os.Stderr, "Error: --poll must be >= 1\n")
+					os.Exit(1)
+				}
+				cfg.poll = v
 			}
 		case "--pid":
 			if i+1 < len(args) {
 				i++
-				cfg.pid, _ = strconv.Atoi(args[i])
+				v, err := strconv.Atoi(args[i])
+				if err != nil || v < 1 {
+					fmt.Fprintf(os.Stderr, "Error: --pid must be a valid process ID\n")
+					os.Exit(1)
+				}
+				cfg.pid = v
 			}
 		case "--pid-file":
 			if i+1 < len(args) {
@@ -89,6 +111,9 @@ func parseGuardArgs(args []string) guardConfig {
 
 	if cfg.warn < 0 {
 		cfg.warn = cfg.threshold - 10
+		if cfg.warn < 0 {
+			cfg.warn = 0
+		}
 	}
 
 	return cfg
@@ -100,6 +125,13 @@ func defaultStateFile() string {
 }
 
 func runGuard(args []string) {
+	// Handle "status" subcommand before parsing guard-specific args
+	if len(args) > 0 && args[0] == "status" {
+		cfg := parseGuardArgs(args[1:])
+		runGuardStatus(cfg)
+		return
+	}
+
 	cfg := parseGuardArgs(args)
 
 	if cfg.pid == 0 && cfg.pidFile == "" {
@@ -109,6 +141,36 @@ func runGuard(args []string) {
 		fmt.Fprintln(os.Stderr, "       claude-usage guard --pid-file ~/.gsd/auto.lock")
 		os.Exit(1)
 	}
+
+	// Put stdin into raw mode to suppress arrow key echo, hide cursor
+	var oldTermState *termios
+	if state, err := setRawInput(); err == nil {
+		oldTermState = state
+		fmt.Print(hideCursor)
+
+		// Drain stdin in background to prevent buffer fill
+		go func() {
+			buf := make([]byte, 64)
+			for {
+				os.Stdin.Read(buf)
+			}
+		}()
+	}
+
+	cleanup := func() {
+		fmt.Print(showCursor)
+		restoreInput(oldTermState)
+		fmt.Println()
+	}
+
+	// Restore terminal on signal
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+	go func() {
+		<-sig
+		cleanup()
+		os.Exit(0)
+	}()
 
 	state := loadGuardState(cfg.stateFile)
 
@@ -124,123 +186,155 @@ func runGuard(args []string) {
 		fmt.Println()
 	}
 
-	for {
-		pid := resolvePID(cfg)
-		if pid == 0 {
-			if !cfg.quiet {
-				fmt.Printf("%s%s  No process to watch — waiting...%s\n", colorDim, timestamp(), colorReset)
-			}
-			time.Sleep(time.Duration(cfg.poll) * time.Second)
-			continue
-		}
+	ticker := time.NewTicker(time.Duration(cfg.poll) * time.Second)
+	defer ticker.Stop()
 
-		// Check if process is still alive
-		if !processAlive(pid) {
-			if !cfg.quiet {
-				fmt.Printf("%s%s  PID %d is gone%s\n", colorDim, timestamp(), pid, colorReset)
-			}
-			if state.Paused {
-				state.Paused = false
-				saveGuardState(cfg.stateFile, state)
-			}
-			time.Sleep(time.Duration(cfg.poll) * time.Second)
-			continue
-		}
-
-		data, err := readUsageFile()
-		if err != nil {
-			if !cfg.quiet {
-				fmt.Printf("%s  %sNo usage data%s\n", timestamp(), colorDim, colorReset)
-			}
-			time.Sleep(time.Duration(cfg.poll) * time.Second)
-			continue
-		}
-
-		// Check staleness
-		age := float64(time.Now().UnixMilli()-data.Timestamp) / 1000
-		if age > 300 {
-			if !cfg.quiet {
-				fmt.Printf("%s  %sUsage data stale (%.0fs old)%s\n", timestamp(), colorDim, age, colorReset)
-			}
-			time.Sleep(time.Duration(cfg.poll) * time.Second)
-			continue
-		}
-
-		if data.Error != nil || data.Limits == nil {
-			time.Sleep(time.Duration(cfg.poll) * time.Second)
-			continue
-		}
-
-		// Find binding constraint (highest utilization)
-		pct, resetAt, windowName := bindingConstraint(data)
-
-		if state.Paused {
-			// Check if we should resume
-			if pct < cfg.warn {
-				fmt.Printf("%s  %s↓ Usage dropped to %d%% (%s) — below warn threshold%s\n",
-					timestamp(), colorGreen, pct, windowName, colorReset)
-
-				if cfg.autoResume {
-					fmt.Printf("%s  %s▶ Auto-resume enabled but process must be restarted externally%s\n",
-						timestamp(), colorGreen, colorReset)
-				}
-
-				state.Paused = false
-				state.WarningSent = false
-				saveGuardState(cfg.stateFile, state)
-			} else if !cfg.quiet {
-				reset := ""
-				if resetAt > 0 {
-					reset = " " + resetCountdown(resetAt)
-				}
-				fmt.Printf("%s  %s⏸ Paused — %d%% %s%s%s\n",
-					timestamp(), colorYellow, pct, windowName, reset, colorReset)
-			}
-		} else {
-			// Normal monitoring
-			if pct >= cfg.threshold {
-				// PAUSE
-				fmt.Printf("%s  %s⚠ %d%% %s — threshold %d%% exceeded!%s\n",
-					timestamp(), colorRed, pct, windowName, cfg.threshold, colorReset)
-
-				if cfg.dryRun {
-					fmt.Printf("%s  %s[DRY RUN] Would send SIGTERM to PID %d%s\n",
-						timestamp(), colorYellow, pid, colorReset)
-				} else {
-					fmt.Printf("%s  %s■ Sending SIGTERM to PID %d%s\n",
-						timestamp(), colorRed, pid, colorReset)
-					if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
-						fmt.Printf("%s  %sFailed to signal PID %d: %s%s\n",
-							timestamp(), colorRed, pid, err, colorReset)
-					}
-				}
-
-				state.Paused = true
-				state.PausedAt = time.Now().UTC().Format(time.RFC3339)
-				state.PauseCount++
-				if resetAt > 0 {
-					state.ResumeAt = time.Unix(int64(resetAt), 0).UTC().Format(time.RFC3339)
-				}
-				saveGuardState(cfg.stateFile, state)
-
-			} else if pct >= cfg.warn && !state.WarningSent {
-				// WARNING
-				fmt.Printf("%s  %s⚡ Warning: %d%% %s — approaching threshold %d%%%s\n",
-					timestamp(), colorYellow, pct, windowName, cfg.threshold, colorReset)
-				state.WarningSent = true
-				state.LastWarning = time.Now().UTC().Format(time.RFC3339)
-				saveGuardState(cfg.stateFile, state)
-
-			} else if !cfg.quiet {
-				color := pctColor(pct)
-				bar := progressBar(pct, 10)
-				fmt.Printf("%s  %s%s %d%%%s %s\n",
-					timestamp(), color, bar, pct, colorReset, windowName)
-			}
-		}
-
-		time.Sleep(time.Duration(cfg.poll) * time.Second)
+	// Run once immediately, then on tick
+	guardTick(&cfg, &state)
+	for range ticker.C {
+		guardTick(&cfg, &state)
 	}
+}
+
+func guardTick(cfg *guardConfig, state *guardState) {
+	pid := resolvePID(*cfg)
+	if pid == 0 {
+		if !cfg.quiet {
+			fmt.Printf("%s%s  waiting for process...%s", clearLine, colorDim, colorReset)
+		}
+		return
+	}
+
+	if !processAlive(pid) {
+		if !cfg.quiet {
+			fmt.Printf("%s%s  PID %d is gone%s", clearLine, colorDim, pid, colorReset)
+		}
+		if state.Paused {
+			state.Paused = false
+			saveGuardState(cfg.stateFile, *state)
+		}
+		return
+	}
+
+	data, err := readUsageFile()
+	if err != nil {
+		if !cfg.quiet {
+			fmt.Printf("%s%s  no usage data%s", clearLine, colorDim, colorReset)
+		}
+		return
+	}
+
+	age := float64(time.Now().UnixMilli()-data.Timestamp) / 1000
+	if age > 300 {
+		if !cfg.quiet {
+			fmt.Printf("%s%s  stale (%.0fs old)%s", clearLine, colorDim, age, colorReset)
+		}
+		return
+	}
+
+	if data.Error != nil || data.Limits == nil {
+		return
+	}
+
+	pct, resetAt, windowName := bindingConstraint(data)
+	summary := usageSummary(data)
+
+	if state.Paused {
+		if pct < cfg.warn {
+			fmt.Printf("%s\n%s  %s↓ Usage dropped to %d%% (%s) — below warn threshold%s\n",
+				clearLine, timestamp(), colorGreen, pct, windowName, colorReset)
+
+			if cfg.autoResume {
+				fmt.Printf("%s  %s▶ Auto-resume: process must be restarted externally%s\n",
+					timestamp(), colorGreen, colorReset)
+			}
+
+			state.Paused = false
+			state.WarningSent = false
+			saveGuardState(cfg.stateFile, *state)
+		} else if !cfg.quiet {
+			reset := ""
+			if resetAt > 0 {
+				reset = "  " + resetCountdown(resetAt)
+			}
+			fmt.Printf("%s%s  ⏸ %s%s", clearLine, colorYellow, summary, colorReset)
+			fmt.Printf("  %s%s%s", colorDim, reset, colorReset)
+		}
+	} else {
+		if pct >= cfg.threshold {
+			fmt.Printf("%s\n%s  %s⚠ %d%% %s — threshold %d%% exceeded!%s\n",
+				clearLine, timestamp(), colorRed, pct, windowName, cfg.threshold, colorReset)
+
+			if cfg.dryRun {
+				fmt.Printf("%s  %s[DRY RUN] Would send SIGTERM to PID %d%s\n",
+					timestamp(), colorYellow, pid, colorReset)
+			} else {
+				fmt.Printf("%s  %s■ Sending SIGTERM to PID %d%s\n",
+					timestamp(), colorRed, pid, colorReset)
+				if err := syscall.Kill(pid, syscall.SIGTERM); err != nil {
+					fmt.Printf("%s  %sFailed to signal PID %d: %s%s\n",
+						timestamp(), colorRed, pid, err, colorReset)
+				}
+			}
+
+			state.Paused = true
+			state.PausedAt = time.Now().UTC().Format(time.RFC3339)
+			state.PauseCount++
+			if resetAt > 0 {
+				state.ResumeAt = time.Unix(int64(resetAt), 0).UTC().Format(time.RFC3339)
+			}
+			saveGuardState(cfg.stateFile, *state)
+
+		} else if pct >= cfg.warn && !state.WarningSent {
+			fmt.Printf("%s\n%s  %s⚡ Warning: %d%% %s — approaching threshold %d%%%s\n",
+				clearLine, timestamp(), colorYellow, pct, windowName, cfg.threshold, colorReset)
+			state.WarningSent = true
+			state.LastWarning = time.Now().UTC().Format(time.RFC3339)
+			saveGuardState(cfg.stateFile, *state)
+
+		} else if !cfg.quiet {
+			fmt.Printf("%s%s  %s", clearLine, timestamp(), summary)
+		}
+	}
+}
+
+// usageSummary returns a compact line showing both session and weekly usage.
+func usageSummary(data *UsageData) string {
+	var parts []string
+
+	if data.Limits.FiveHour != nil && data.Limits.FiveHour.UtilizationPct != nil {
+		pct := *data.Limits.FiveHour.UtilizationPct
+		c := pctColor(pct)
+		bar := progressBar(pct, 10)
+		s := fmt.Sprintf("%s%s %d%%%s 5h", c, bar, pct, colorReset)
+		if data.Limits.FiveHour.ResetsAt != nil {
+			r := resetCountdown(*data.Limits.FiveHour.ResetsAt)
+			if r != "" {
+				s += fmt.Sprintf(" %s%s%s", colorDim, r, colorReset)
+			}
+		}
+		parts = append(parts, s)
+	}
+
+	if data.Limits.SevenDay != nil && data.Limits.SevenDay.UtilizationPct != nil {
+		pct := *data.Limits.SevenDay.UtilizationPct
+		c := pctColor(pct)
+		bar := progressBar(pct, 10)
+		s := fmt.Sprintf("%s%s %d%%%s 7d", c, bar, pct, colorReset)
+		if data.Limits.SevenDay.ResetsAt != nil {
+			r := resetCountdown(*data.Limits.SevenDay.ResetsAt)
+			if r != "" {
+				s += fmt.Sprintf(" %s%s%s", colorDim, r, colorReset)
+			}
+		}
+		parts = append(parts, s)
+	}
+
+	if len(parts) == 0 {
+		return fmt.Sprintf("%sno data%s", colorDim, colorReset)
+	}
+
+	return strings.Join(parts, "  │  ")
 }
 
 // ── Guard status (one-shot) ────────────────────────────────────────
@@ -262,18 +356,9 @@ func runGuardStatus(cfg guardConfig) {
 		os.Exit(0)
 	}
 
-	pct, resetAt, windowName := bindingConstraint(data)
-	color := pctColor(pct)
-	bar := progressBar(pct, 20)
-
 	fmt.Println()
-	fmt.Printf("  %s%s%s %s%d%%%s  %s", color, bar, colorReset, color, pct, colorReset, windowName)
-	if resetAt > 0 {
-		fmt.Printf("  %s%s%s", colorDim, resetCountdown(resetAt), colorReset)
-	}
-	fmt.Println()
+	fmt.Printf("  %s\n", usageSummary(data))
 
-	// Show state if exists
 	state := loadGuardState(cfg.stateFile)
 	if state.PauseCount > 0 {
 		fmt.Println()
@@ -361,9 +446,68 @@ func loadGuardState(path string) guardState {
 }
 
 func saveGuardState(path string, state guardState) {
-	os.MkdirAll(filepath.Dir(path), 0755)
-	data, _ := json.MarshalIndent(state, "", "  ")
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "\n%sWarning: cannot create state dir: %s%s\n", colorYellow, err, colorReset)
+		return
+	}
+	out, err := json.MarshalIndent(state, "", "  ")
+	if err != nil {
+		return
+	}
 	tmp := path + ".tmp"
-	os.WriteFile(tmp, data, 0644)
-	os.Rename(tmp, path)
+	if err := os.WriteFile(tmp, out, 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "\n%sWarning: cannot write state: %s%s\n", colorYellow, err, colorReset)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		fmt.Fprintf(os.Stderr, "\n%sWarning: cannot save state: %s%s\n", colorYellow, err, colorReset)
+	}
+}
+
+// ── Terminal raw mode (macOS-specific, suppress input echo) ────────
+
+type termios struct {
+	Iflag  uint64
+	Oflag  uint64
+	Cflag  uint64
+	Lflag  uint64
+	Cc     [20]byte
+	Ispeed uint64
+	Ospeed uint64
+}
+
+func tcget(fd uintptr) (*termios, error) {
+	var t termios
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCGETA), uintptr(unsafe.Pointer(&t)))
+	if errno != 0 {
+		return nil, errno
+	}
+	return &t, nil
+}
+
+func tcset(fd uintptr, t *termios) error {
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, uintptr(syscall.TIOCSETA), uintptr(unsafe.Pointer(t)))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func setRawInput() (*termios, error) {
+	old, err := tcget(os.Stdin.Fd())
+	if err != nil {
+		return nil, err
+	}
+	raw := *old
+	raw.Lflag &^= syscall.ECHO | syscall.ICANON
+	if err := tcset(os.Stdin.Fd(), &raw); err != nil {
+		return nil, err
+	}
+	return old, nil
+}
+
+func restoreInput(t *termios) {
+	if t != nil {
+		tcset(os.Stdin.Fd(), t)
+	}
 }
