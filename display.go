@@ -3,7 +3,6 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"strings"
 	"time"
@@ -20,13 +19,13 @@ const (
 )
 
 func runDisplay() {
-	data := pingAPI()
+	data := fetchUsageSnapshot()
 	writeUsageFile(data)
 	formatDisplay(data)
 }
 
 func runJSON() {
-	data := pingAPI()
+	data := fetchUsageSnapshot()
 	writeUsageFile(data)
 	out, _ := json.MarshalIndent(data, "", "  ")
 	fmt.Println(string(out))
@@ -42,124 +41,134 @@ func runRead() {
 }
 
 func runStatusMode() {
-	data := pingAPI()
+	data := fetchUsageSnapshot()
 	writeUsageFile(data)
 	formatStatus(data)
 }
 
-func formatDisplay(d *UsageData) {
-	if d.Error != nil {
-		printError(*d.Error)
-		return
-	}
-
-	// Timestamp
-	ago := timeAgo(d.Timestamp)
-
+func formatDisplay(d *UsageSnapshot) {
 	fmt.Println()
 	fmt.Printf("%sUsage Status%s\n", colorBold, colorReset)
-	fmt.Printf("%sUpdated %s%s\n", colorDim, ago, colorReset)
+	fmt.Printf("%sUpdated %s%s\n", colorDim, timeAgo(d.Timestamp), colorReset)
 	fmt.Println()
 
-	// Auth info
-	if d.Auth != nil {
-		tier := tierDisplay(d.Auth.RateLimitTier)
-		sub := d.Auth.SubscriptionType
-		if sub == "" {
-			sub = "unknown"
-		} else {
-			sub = strings.ToUpper(sub[:1]) + sub[1:]
-		}
-		fmt.Printf("  %sPlan%s           %s (%s)\n", colorBlue, colorReset, tier, sub)
-	}
-
-	if d.Limits == nil {
-		fmt.Printf("  %sNo limit data available%s\n\n", colorDim, colorReset)
+	order := availableProviders(d)
+	if len(order) == 0 {
+		fmt.Printf("  %sNo supported provider data available.%s\n\n", colorDim, colorReset)
 		return
 	}
 
-	// Status
-	statusColor, statusLabel := statusDisplay(d.Limits.Status)
-	fmt.Printf("  %sStatus%s         %s%s%s\n", colorBlue, colorReset, statusColor, statusLabel, colorReset)
+	for idx, name := range order {
+		if idx > 0 {
+			fmt.Println()
+		}
+		formatProviderDisplay(name, d.Providers[name])
+	}
+	fmt.Println()
+}
+
+func formatProviderDisplay(name string, provider *ProviderSnapshot) {
+	title := providerDisplayName(name)
+	fmt.Printf("  %s%s%s\n", colorBold, title, colorReset)
+	fmt.Printf("  %sUpdated %s%s\n", colorDim, timeAgo(provider.Timestamp), colorReset)
+
+	if provider.Error != nil {
+		fmt.Printf("  %sError%s         %s\n", colorBlue, colorReset, *provider.Error)
+		return
+	}
+
+	if provider.Auth != nil {
+		if plan := providerPlanLabel(name, provider.Auth); plan != "" {
+			fmt.Printf("  %sPlan%s          %s\n", colorBlue, colorReset, plan)
+		}
+		if provider.Auth.Email != "" {
+			fmt.Printf("  %sAccount%s       %s\n", colorBlue, colorReset, provider.Auth.Email)
+		}
+	}
+
+	if provider.Limits == nil {
+		fmt.Printf("  %sNo limit data available%s\n", colorDim, colorReset)
+		return
+	}
+
+	if status := providerStatusLabel(name, provider.Limits); status != "" {
+		fmt.Printf("  %sStatus%s        %s\n", colorBlue, colorReset, status)
+	}
+	if provider.Limits.Credits != nil {
+		fmt.Printf("  %sCredits%s       %s\n", colorBlue, colorReset, formatCredits(provider.Limits.Credits))
+	}
 	fmt.Println()
 
-	// Meters
-	type meter struct {
-		key   string
-		label string
-		w     *WindowInfo
-	}
-	meters := []meter{
-		{"five_hour", "Session (5h)", d.Limits.FiveHour},
-		{"seven_day", "Weekly (7d)", d.Limits.SevenDay},
-	}
-
-	for _, m := range meters {
-		if m.w == nil || m.w.UtilizationPct == nil {
+	windows := []*WindowInfo{provider.Limits.Primary, provider.Limits.Secondary}
+	for i, window := range windows {
+		if window == nil || window.UtilizationPct == nil {
 			continue
 		}
-		pct := *m.w.UtilizationPct
+		pct := providerDisplayPct(name, *window.UtilizationPct)
 		color := pctColor(pct)
 		bar := progressBar(pct, 20)
-
+		label := providerWindowLabel(name, window, i)
 		reset := ""
-		if m.w.ResetsAt != nil {
-			reset = resetCountdown(*m.w.ResetsAt)
+		if window.ResetsAt != nil {
+			reset = resetCountdown(*window.ResetsAt)
 		}
 
-		line := fmt.Sprintf("  %s%s%s %s%3d%%%s  %s", color, bar, colorReset, color, pct, colorReset, m.label)
+		line := fmt.Sprintf("  %s%s%s %s%3d%%%s  %s", color, bar, colorReset, color, pct, colorReset, label)
 		if reset != "" {
 			line += fmt.Sprintf("  %s%s%s", colorDim, reset, colorReset)
 		}
 		fmt.Println(line)
 	}
 
-	// Overage
-	if d.Limits.Overage != nil && d.Limits.Overage.Status != "" {
-		oc, ol := overageDisplay(d.Limits.Overage.Status)
-		fmt.Println()
-		if d.Limits.Overage.Utilization != nil && *d.Limits.Overage.Utilization > 0 {
-			fmt.Printf("  Extra usage: %s%s%s  |  Usage: %.0f%%\n", oc, ol, colorReset, *d.Limits.Overage.Utilization*100)
-		} else {
-			fmt.Printf("  Extra usage: %s%s%s\n", oc, ol, colorReset)
+	if name == "claude" {
+		if provider.Limits.Overage != nil && provider.Limits.Overage.Status != "" {
+			oc, ol := overageDisplay(provider.Limits.Overage.Status)
+			fmt.Println()
+			if provider.Limits.Overage.Utilization != nil && *provider.Limits.Overage.Utilization > 0 {
+				fmt.Printf("  Extra usage: %s%s%s  |  Usage: %.0f%%\n", oc, ol, colorReset, *provider.Limits.Overage.Utilization*100)
+			} else {
+				fmt.Printf("  Extra usage: %s%s%s\n", oc, ol, colorReset)
+			}
+		}
+		if provider.Limits.Fallback == "available" {
+			fmt.Printf("  %sModel fallback available%s\n", colorDim, colorReset)
 		}
 	}
-
-	// Fallback
-	if d.Limits.Fallback == "available" {
-		fmt.Printf("  %sModel fallback available%s\n", colorDim, colorReset)
-	}
-
-	fmt.Println()
 }
 
-func formatStatus(d *UsageData) {
-	if d.Error != nil {
-		fmt.Printf("ERR: %s\n", *d.Error)
-		os.Exit(1)
-	}
-	if d.Limits == nil {
-		fmt.Println("no data")
+func formatStatus(d *UsageSnapshot) {
+	order := availableProviders(d)
+	if len(order) == 0 {
+		fmt.Println("no providers")
 		return
 	}
 
-	pct5 := "?"
-	pct7 := "?"
-	if d.Limits.FiveHour != nil && d.Limits.FiveHour.UtilizationPct != nil {
-		pct5 = fmt.Sprintf("%d", *d.Limits.FiveHour.UtilizationPct)
+	for _, name := range order {
+		provider := d.Providers[name]
+		if provider.Error != nil {
+			fmt.Printf("%s ERR: %s\n", name, *provider.Error)
+			continue
+		}
+		fmt.Println(formatProviderStatus(name, provider))
 	}
-	if d.Limits.SevenDay != nil && d.Limits.SevenDay.UtilizationPct != nil {
-		pct7 = fmt.Sprintf("%d", *d.Limits.SevenDay.UtilizationPct)
-	}
+}
 
-	status := d.Limits.Status
-	if status == "" {
-		status = "?"
+func formatProviderStatus(name string, provider *ProviderSnapshot) string {
+	var primary, secondary string
+	if provider.Limits != nil && provider.Limits.Primary != nil && provider.Limits.Primary.UtilizationPct != nil {
+		primary = fmt.Sprintf("%d", providerDisplayPct(name, *provider.Limits.Primary.UtilizationPct))
+	} else {
+		primary = "?"
+	}
+	if provider.Limits != nil && provider.Limits.Secondary != nil && provider.Limits.Secondary.UtilizationPct != nil {
+		secondary = fmt.Sprintf("%d", providerDisplayPct(name, *provider.Limits.Secondary.UtilizationPct))
+	} else {
+		secondary = "?"
 	}
 
 	reset := ""
-	if d.Limits.FiveHour != nil && d.Limits.FiveHour.ResetsAt != nil {
-		diff := int(*d.Limits.FiveHour.ResetsAt - float64(time.Now().Unix()))
+	if provider.Limits != nil && provider.Limits.Primary != nil && provider.Limits.Primary.ResetsAt != nil {
+		diff := int(*provider.Limits.Primary.ResetsAt - time.Now().Unix())
 		if diff > 0 {
 			h := diff / 3600
 			m := (diff % 3600) / 60
@@ -171,10 +180,21 @@ func formatStatus(d *UsageData) {
 		}
 	}
 
-	fmt.Printf("session %s%%  weekly %s%%  [%s]%s\n", pct5, pct7, status, reset)
+	switch name {
+	case "codex":
+		plan := "?"
+		if provider.Auth != nil && provider.Auth.PlanType != "" {
+			plan = provider.Auth.PlanType
+		}
+		return fmt.Sprintf("codex  5h left %s%%  weekly left %s%%  [%s]%s", primary, secondary, plan, reset)
+	default:
+		status := "?"
+		if provider.Limits != nil && provider.Limits.Status != "" {
+			status = provider.Limits.Status
+		}
+		return fmt.Sprintf("claude used %s%%  weekly used %s%%  [%s]%s", primary, secondary, status, reset)
+	}
 }
-
-// Helpers
 
 func printError(err string) {
 	if strings.Contains(err, "keychain") || strings.Contains(err, "auth") {
@@ -207,8 +227,8 @@ func pctColor(pct int) string {
 	return colorGreen
 }
 
-func resetCountdown(resetsAt float64) string {
-	diff := int(resetsAt - float64(time.Now().Unix()))
+func resetCountdown(resetsAt int64) string {
+	diff := int(resetsAt - time.Now().Unix())
 	if diff <= 0 {
 		return ""
 	}
@@ -225,6 +245,9 @@ func resetCountdown(resetsAt float64) string {
 }
 
 func timeAgo(tsMs int64) string {
+	if tsMs == 0 {
+		return "unknown"
+	}
 	diff := int(time.Now().Unix() - tsMs/1000)
 	if diff < 10 {
 		return "just now"
@@ -281,32 +304,40 @@ func overageDisplay(s string) (string, string) {
 	}
 }
 
-// formatUsageBar returns a compact colored usage bar for statusline integration.
 func formatUsageBar() string {
 	data, err := readUsageFile()
 	if err != nil {
 		return ""
 	}
 
-	age := float64(time.Now().UnixMilli()-data.Timestamp) / 1000
-	if age > 300 || data.Error != nil {
-		return ""
+	var parts []string
+	for _, name := range availableProviders(data) {
+		provider := dProvider(data, name)
+		if provider == nil || provider.Error != nil || provider.Limits == nil || provider.Limits.Primary == nil || provider.Limits.Primary.UtilizationPct == nil {
+			continue
+		}
+		age := float64(time.Now().UnixMilli()-provider.Timestamp) / 1000
+		if age > 300 {
+			continue
+		}
+		parts = append(parts, formatProviderUsageBar(name, provider))
 	}
 
-	if data.Limits == nil || data.Limits.FiveHour == nil || data.Limits.FiveHour.UtilizationPct == nil {
-		return ""
-	}
+	return strings.Join(parts, " │ ")
+}
 
-	pct := *data.Limits.FiveHour.UtilizationPct
+func formatProviderUsageBar(name string, provider *ProviderSnapshot) string {
+	pct := providerDisplayPct(name, *provider.Limits.Primary.UtilizationPct)
 	color := pctColor(pct)
 	bar := progressBar(pct, 10)
+	label := providerBarLabel(name)
 
 	reset := ""
-	if data.Limits.FiveHour.ResetsAt != nil {
-		diff := *data.Limits.FiveHour.ResetsAt - float64(time.Now().Unix())
+	if provider.Limits.Primary.ResetsAt != nil {
+		diff := *provider.Limits.Primary.ResetsAt - time.Now().Unix()
 		if diff > 0 {
-			h := int(math.Floor(diff / 3600))
-			m := int(math.Floor(math.Mod(diff, 3600) / 60))
+			h := int(diff / 3600)
+			m := int((diff % 3600) / 60)
 			if h > 0 {
 				reset = fmt.Sprintf("  resets %dh %dm", h, m)
 			} else {
@@ -315,19 +346,125 @@ func formatUsageBar() string {
 		}
 	}
 
-	result := fmt.Sprintf("%s%s %d%%%s session%s%s%s", color, bar, pct, colorReset, colorDim, reset, colorReset)
+	result := fmt.Sprintf("%s%s %d%%%s %s%s%s", color, bar, pct, colorReset, label, colorDim, reset)
+	if reset != "" {
+		result += colorReset
+	}
+	return result
+}
 
-	// Weekly when >= 75%
-	if data.Limits.SevenDay != nil && data.Limits.SevenDay.UtilizationPct != nil {
-		weekly := *data.Limits.SevenDay.UtilizationPct
-		if weekly >= 75 {
-			wc := colorYellow
-			if weekly >= 80 {
-				wc = colorRed
+func providerDisplayName(name string) string {
+	switch name {
+	case "codex":
+		return "Codex"
+	default:
+		return "Claude"
+	}
+}
+
+func providerPlanLabel(name string, auth *ProviderAuth) string {
+	switch name {
+	case "codex":
+		if auth.PlanType == "" {
+			return ""
+		}
+		return strings.ToUpper(auth.PlanType[:1]) + auth.PlanType[1:]
+	default:
+		tier := tierDisplay(auth.RateLimitTier)
+		sub := auth.SubscriptionType
+		if sub == "" {
+			return tier
+		}
+		return fmt.Sprintf("%s (%s)", tier, strings.ToUpper(sub[:1])+sub[1:])
+	}
+}
+
+func providerStatusLabel(name string, limits *ProviderLimits) string {
+	switch name {
+	case "codex":
+		if limits.RateLimitReachedType != "" {
+			return limits.RateLimitReachedType
+		}
+		if limits.Status != "" {
+			return limits.Status
+		}
+		return ""
+	default:
+		if limits.Status == "" {
+			return ""
+		}
+		c, label := statusDisplay(limits.Status)
+		return c + label + colorReset
+	}
+}
+
+func providerWindowLabel(name string, window *WindowInfo, index int) string {
+	if name == "codex" {
+		if window.WindowMinutes != nil {
+			switch *window.WindowMinutes {
+			case 300:
+				return "5h left"
+			case 10080:
+				return "Weekly left"
+			default:
+				return fmt.Sprintf("%dm left", *window.WindowMinutes)
 			}
-			result += fmt.Sprintf(" %s7d:%d%%%s", wc, weekly, colorReset)
 		}
 	}
+	if index == 0 {
+		return "Session used (5h)"
+	}
+	return "Weekly used (7d)"
+}
 
-	return result
+func providerBarLabel(name string) string {
+	if name == "codex" {
+		return "codex left"
+	}
+	return "claude used"
+}
+
+func providerDisplayPct(name string, usedPct int) int {
+	if name != "codex" {
+		return usedPct
+	}
+	remaining := 100 - usedPct
+	if remaining < 0 {
+		return 0
+	}
+	if remaining > 100 {
+		return 100
+	}
+	return remaining
+}
+
+func formatCredits(c *CreditsInfo) string {
+	if c.Unlimited {
+		return "unlimited"
+	}
+	if !c.HasCredits {
+		return "depleted"
+	}
+	if c.Balance != nil && *c.Balance != "" {
+		return "$" + *c.Balance
+	}
+	return "available"
+}
+
+func availableProviders(d *UsageSnapshot) []string {
+	order := []string{"claude", "codex"}
+	var providers []string
+	for _, name := range order {
+		if d.Providers[name] != nil {
+			providers = append(providers, name)
+		}
+	}
+	return providers
+}
+
+func dProvider(d *UsageSnapshot, name string) *ProviderSnapshot {
+	if d == nil || d.Providers == nil {
+		return nil
+	}
+	return d.Providers[name]
 }

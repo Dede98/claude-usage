@@ -49,18 +49,18 @@ func main() {
 }
 
 func showHelp() {
-	fmt.Print(`claude-usage — Monitor your Claude rate limits
+	fmt.Print(`claude-usage — Monitor your Claude and Codex usage limits
 
 USAGE
-  claude-usage              Ping API, display formatted output
-  claude-usage --json       Ping API, output JSON
+  claude-usage              Refresh providers, display formatted output
+  claude-usage --json       Refresh providers, output JSON
   claude-usage --read       Display from cached file (no API call)
-  claude-usage --watch      Ping every 60s, display live
-  claude-usage --daemon     Background: ping + write to file
+  claude-usage --watch      Refresh every 60s, display live
+  claude-usage --daemon     Background: refresh + write to file
   claude-usage --status     One-line summary for scripting
   claude-usage --version    Show version
 
-  claude-usage install          Install statusline integration
+  claude-usage install          Install Claude Code statusline integration
   claude-usage install --daemon Also install background daemon
   claude-usage uninstall        Remove everything
 
@@ -72,9 +72,10 @@ USAGE
   claude-usage statusline --wrap CMD   Wrap existing statusline command
 
 HOW IT WORKS
-  Reads your OAuth token from macOS Keychain (stored by Claude Code)
-  and makes a 1-token API call. Rate limit data comes from response
-  headers — no scraping, no browser extension.
+  Claude: reads your OAuth token from macOS Keychain and makes a
+  1-token API call. Codex: reads live subscription limits from the
+  local Codex app-server. Claude Code statusline can be configured
+  automatically; Codex uses its own native /statusline setup.
 
 100% vibecoded. Not affiliated with Anthropic. Use at your own risk.
 `)

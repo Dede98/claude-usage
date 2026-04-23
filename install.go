@@ -11,8 +11,8 @@ import (
 )
 
 const (
-	plistLabel  = "com.claude-usage.daemon"
-	configName  = "claude-usage-config.json"
+	plistLabel = "com.claude-usage.daemon"
+	configName = "claude-usage-config.json"
 )
 
 type installConfig struct {
@@ -73,17 +73,20 @@ func runInstall(args []string) {
 	// 5. Verify
 	fmt.Println()
 	fmt.Printf("%sVerifying...%s\n", colorDim, colorReset)
-	data := pingAPI()
+	data := fetchUsageSnapshot()
 	writeUsageFile(data)
-	if data.Error != nil {
+	if len(data.Providers) == 0 {
 		fmt.Println()
-		fmt.Println("Keychain access failed. Make sure:")
-		fmt.Println("  1. Claude Code is installed")
-		fmt.Println("  2. You've logged in (run: claude /login)")
-		fmt.Println("  3. macOS Keychain access is allowed")
+		fmt.Println("No provider data available. Make sure at least one is configured:")
+		fmt.Println("  1. Claude Code is installed and logged in (run: claude /login)")
+		fmt.Println("  2. Codex is installed and logged in with ChatGPT")
 	} else {
 		formatStatus(data)
 		fmt.Printf("\n%sDone.%s Run %sclaude-usage%s to see your limits.\n", colorGreen, colorReset, colorBold, colorReset)
+		fmt.Println("Claude Code statusline was configured automatically.")
+		fmt.Println("Codex CLI has its own native status line. In Codex, run /statusline and enable:")
+		fmt.Println("  - Remaining usage on 5-hour usage limit")
+		fmt.Println("  - Remaining usage on weekly usage limit")
 	}
 }
 

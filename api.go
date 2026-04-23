@@ -14,65 +14,26 @@ const (
 	pingModel = "claude-haiku-4-5-20251001"
 )
 
-type UsageData struct {
-	Version   int        `json:"version"`
-	Timestamp int64      `json:"timestamp"`
-	Source    string     `json:"source"`
-	Auth      *AuthInfo  `json:"auth"`
-	Limits    *LimitsInfo `json:"limits"`
-	Error     *string    `json:"error"`
-}
-
-type AuthInfo struct {
-	SubscriptionType string `json:"subscription_type"`
-	RateLimitTier    string `json:"rate_limit_tier"`
-	TokenExpiresAt   int64  `json:"token_expires_at"`
-}
-
-type LimitsInfo struct {
-	FiveHour            *WindowInfo  `json:"five_hour"`
-	SevenDay            *WindowInfo  `json:"seven_day"`
-	Overage             *OverageInfo `json:"overage"`
-	Status              string       `json:"status"`
-	RepresentativeClaim string       `json:"representative_claim"`
-	Fallback            string       `json:"fallback"`
-}
-
-type WindowInfo struct {
-	Utilization    *float64 `json:"utilization"`
-	UtilizationPct *int     `json:"utilization_pct"`
-	ResetsAt       *float64 `json:"resets_at"`
-	ResetsAtISO    *string  `json:"resets_at_iso"`
-}
-
-type OverageInfo struct {
-	Status      string   `json:"status"`
-	Utilization *float64 `json:"utilization"`
-}
-
-func pingAPI() *UsageData {
-	now := time.Now().UnixMilli()
-
+func fetchClaudeProvider(now int64) (*ProviderSnapshot, bool) {
 	creds, err := getCredentials()
 	if err != nil {
+		if isClaudeUnavailable(err) {
+			return nil, false
+		}
 		errStr := fmt.Sprintf("auth_failed: %s. Run 'claude /login' first.", err)
-		return &UsageData{Version: 1, Timestamp: now, Source: "api", Error: &errStr}
+		return &ProviderSnapshot{Timestamp: now, Source: "api", Error: &errStr}, true
+	}
+
+	auth := &ProviderAuth{
+		AccountType:      "oauth",
+		SubscriptionType: creds.SubscriptionType,
+		RateLimitTier:    creds.RateLimitTier,
+		TokenExpiresAt:   creds.ExpiresAt,
 	}
 
 	if creds.isExpired() {
 		errStr := "token_expired. Open Claude Code to refresh your session."
-		auth := &AuthInfo{
-			SubscriptionType: creds.SubscriptionType,
-			RateLimitTier:    creds.RateLimitTier,
-			TokenExpiresAt:   creds.ExpiresAt,
-		}
-		return &UsageData{Version: 1, Timestamp: now, Source: "api", Auth: auth, Error: &errStr}
-	}
-
-	auth := &AuthInfo{
-		SubscriptionType: creds.SubscriptionType,
-		RateLimitTier:    creds.RateLimitTier,
-		TokenExpiresAt:   creds.ExpiresAt,
+		return &ProviderSnapshot{Timestamp: now, Source: "api", Auth: auth, Error: &errStr}, true
 	}
 
 	body := fmt.Sprintf(`{"model":"%s","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`, pingModel)
@@ -86,34 +47,38 @@ func pingAPI() *UsageData {
 	resp, err := client.Do(req)
 	if err != nil {
 		errStr := fmt.Sprintf("request_failed: %s", err)
-		return &UsageData{Version: 1, Timestamp: now, Source: "api", Auth: auth, Error: &errStr}
+		return &ProviderSnapshot{Timestamp: now, Source: "api", Auth: auth, Error: &errStr}, true
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode >= 400 {
 		errStr := fmt.Sprintf("HTTP %d", resp.StatusCode)
-		return &UsageData{Version: 1, Timestamp: now, Source: "api", Auth: auth, Error: &errStr}
+		return &ProviderSnapshot{Timestamp: now, Source: "api", Auth: auth, Error: &errStr}, true
 	}
 
-	return parseHeaders(resp.Header, auth, now)
+	return parseClaudeHeaders(resp.Header, auth, now), true
 }
 
-func parseHeaders(h http.Header, auth *AuthInfo, ts int64) *UsageData {
+func isClaudeUnavailable(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "keychain") || strings.Contains(msg, "no_token")
+}
+
+func parseClaudeHeaders(h http.Header, auth *ProviderAuth, ts int64) *ProviderSnapshot {
 	get := func(name string) string {
 		return h.Get("anthropic-ratelimit-unified-" + name)
 	}
 
-	limits := &LimitsInfo{
-		FiveHour:            parseWindow(get("5h-utilization"), get("5h-reset")),
-		SevenDay:            parseWindow(get("7d-utilization"), get("7d-reset")),
+	limits := &ProviderLimits{
+		Primary:             parseClaudeWindow(get("5h-utilization"), get("5h-reset"), 300),
+		Secondary:           parseClaudeWindow(get("7d-utilization"), get("7d-reset"), 10080),
 		Overage:             parseOverage(get("overage-status"), get("overage-utilization")),
 		Status:              get("status"),
 		RepresentativeClaim: get("representative-claim"),
 		Fallback:            get("fallback"),
 	}
 
-	return &UsageData{
-		Version:   1,
+	return &ProviderSnapshot{
 		Timestamp: ts,
 		Source:    "api",
 		Auth:      auth,
@@ -121,7 +86,7 @@ func parseHeaders(h http.Header, auth *AuthInfo, ts int64) *UsageData {
 	}
 }
 
-func parseWindow(utilStr, resetStr string) *WindowInfo {
+func parseClaudeWindow(utilStr, resetStr string, windowMinutes int64) *WindowInfo {
 	if utilStr == "" {
 		return nil
 	}
@@ -135,10 +100,12 @@ func parseWindow(utilStr, resetStr string) *WindowInfo {
 	}
 
 	if v, err := strconv.ParseFloat(resetStr, 64); err == nil {
-		w.ResetsAt = &v
-		iso := time.Unix(int64(v), 0).UTC().Format("2006-01-02T15:04:05+00:00")
+		resetAt := int64(v)
+		w.ResetsAt = &resetAt
+		iso := time.Unix(resetAt, 0).UTC().Format("2006-01-02T15:04:05+00:00")
 		w.ResetsAtISO = &iso
 	}
+	w.WindowMinutes = &windowMinutes
 
 	return w
 }
