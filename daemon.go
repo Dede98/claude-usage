@@ -34,7 +34,7 @@ func runDaemonMode() {
 	}()
 
 	for {
-		data := pingAPI()
+		data := fetchUsageSnapshot()
 		writeUsageFile(data)
 		time.Sleep(time.Duration(interval) * time.Second)
 	}
@@ -52,7 +52,7 @@ func runWatch() {
 		// Clear screen
 		fmt.Print("\033[2J\033[H")
 
-		data := pingAPI()
+		data := fetchUsageSnapshot()
 		writeUsageFile(data)
 		formatDisplay(data)
 

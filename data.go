@@ -14,7 +14,7 @@ func usageFilePath() string {
 	return filepath.Join(home, ".claude", "usage-data.json")
 }
 
-func writeUsageFile(data *UsageData) error {
+func writeUsageFile(data *UsageSnapshot) error {
 	path := usageFilePath()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -33,14 +33,17 @@ func writeUsageFile(data *UsageData) error {
 	return os.Rename(tmp, path)
 }
 
-func readUsageFile() (*UsageData, error) {
+func readUsageFile() (*UsageSnapshot, error) {
 	raw, err := os.ReadFile(usageFilePath())
 	if err != nil {
 		return nil, err
 	}
-	var data UsageData
+	var data UsageSnapshot
 	if err := json.Unmarshal(raw, &data); err != nil {
 		return nil, err
+	}
+	if data.Providers == nil {
+		data.Providers = map[string]*ProviderSnapshot{}
 	}
 	return &data, nil
 }

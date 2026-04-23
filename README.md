@@ -4,11 +4,11 @@
 >
 > **100% vibecoded.** This entire tool was written by Claude. The author takes no responsibility for anything — use at your own risk.
 
-See your Claude rate limits in real time. Session percentage, reset timers, weekly usage, overage status. Works anywhere — terminal, status bar, scripts.
+See your Claude and Codex usage limits in real time. Works anywhere — terminal, status bar, scripts.
 
 ![claude-usage screenshot](screenshot.png)
 
-Reads your existing Claude Code OAuth token from macOS Keychain and makes a single 1-token API call to get rate limit data from response headers.
+Claude data comes from a 1-token API call against Anthropic's headers. Codex data comes from your local Codex installation, using the app-server when possible and falling back to recent local Codex session snapshots.
 
 ## Quick install
 
@@ -42,20 +42,18 @@ claude-usage install
 
 ## How it works
 
-1. Reads your OAuth token from macOS Keychain (stored by Claude Code when you run `/login`)
-2. Makes a minimal API call (1 output token, Haiku) — costs ~$0.00025/day
-3. Parses `anthropic-ratelimit-unified-*` response headers for real-time usage data
-4. Writes to `~/.claude/usage-data.json` for other tools to consume
-
-No scraping. No cookies. Just one authenticated API call that returns your limits in the response headers.
+1. Claude: reads your OAuth token from macOS Keychain and makes a minimal API call
+2. Claude: parses `anthropic-ratelimit-unified-*` response headers for live limit data
+3. Codex: reads local subscription limit state from Codex
+4. Writes a combined snapshot to `~/.claude/usage-data.json` for other tools to consume
 
 ## Usage
 
 ```bash
-claude-usage              # Ping API, show formatted output
-claude-usage --json       # Ping API, output JSON
+claude-usage              # Refresh providers, show formatted output
+claude-usage --json       # Refresh providers, output JSON
 claude-usage --watch      # Live refresh every 60s
-claude-usage --daemon     # Background mode: ping + write to file
+claude-usage --daemon     # Background mode: refresh + write to file
 claude-usage --read       # Display from cached file (no API call)
 claude-usage --status     # One-line summary for scripting
 ```
@@ -121,6 +119,23 @@ Or to wrap an existing statusline:
 
 Colors change automatically: green (< 50%), yellow (< 80%), red (>= 80%). Weekly usage appears when >= 75%.
 
+### Codex CLI status line
+
+Codex has its own native status line. This tool does **not** inject a custom command into Codex the way it does for Claude Code.
+
+Recommended setup inside Codex:
+
+1. Run `/statusline`
+2. Enable these built-in items:
+   - `Remaining usage on 5-hour usage limit`
+   - `Remaining usage on weekly usage limit`
+3. Optionally also enable:
+   - `Current model name with reasoning level`
+   - `Percentage of context window remaining`
+   - `Total tokens used in session`
+
+This is the preferred Codex setup because it uses Codex's native status line and live limit data directly.
+
 ### Background daemon
 
 The `install --daemon` command sets up a launchd service for continuous polling:
@@ -134,11 +149,12 @@ launchctl load ~/Library/LaunchAgents/com.claude-usage.daemon.plist    # Start
 
 ### Scripting
 
-The `--status` flag outputs a single line, useful for tmux, polybar, or other status bars:
+The `--status` flag outputs one line per available provider, useful for tmux, polybar, or other status bars:
 
 ```bash
 $ claude-usage --status
-session 67%  weekly 31%  [allowed]  resets 2h14m
+claude used 67%  weekly used 31%  [allowed]  resets 2h14m
+codex  5h left 81%  weekly left 56%  [plus]  resets 4h3m
 ```
 
 ## Data format
@@ -147,36 +163,63 @@ The tool writes `~/.claude/usage-data.json` with this schema:
 
 ```jsonc
 {
-  "version": 1,
+  "version": 2,
   "timestamp": 1711882800000,        // Unix ms when fetched
-  "source": "api",
-  "auth": {
-    "subscription_type": "team",     // From keychain
-    "rate_limit_tier": "default_claude_max_5x",
-    "token_expires_at": 1774996245508
-  },
-  "limits": {
-    "five_hour": {
-      "utilization": 0.67,           // 0.0-1.0 (raw)
-      "utilization_pct": 67,         // 0-100 (display)
-      "resets_at": 1711890000,       // Unix epoch seconds
-      "resets_at_iso": "2026-03-31T17:00:00+00:00"
+  "providers": {
+    "claude": {
+      "timestamp": 1711882800000,
+      "source": "api",
+      "auth": {
+        "account_type": "oauth",
+        "subscription_type": "team",
+        "rate_limit_tier": "default_claude_max_5x",
+        "token_expires_at": 1774996245508
+      },
+      "limits": {
+        "primary": {
+          "utilization": 0.67,
+          "utilization_pct": 67,
+          "resets_at": 1711890000,
+          "window_minutes": 300
+        },
+        "secondary": {
+          "utilization": 0.31,
+          "utilization_pct": 31,
+          "resets_at": 1712300000,
+          "window_minutes": 10080
+        },
+        "status": "allowed"
+      },
+      "error": null
     },
-    "seven_day": {
-      "utilization": 0.31,
-      "utilization_pct": 31,
-      "resets_at": 1712300000,
-      "resets_at_iso": "2026-04-05T13:00:00+00:00"
-    },
-    "overage": {
-      "status": "allowed",           // "allowed", "allowed_warning", "rejected"
-      "utilization": 0.0
-    },
-    "status": "allowed",             // Overall: "allowed", "allowed_warning", "rejected"
-    "representative_claim": "five_hour",
-    "fallback": "available"          // "available" if model fallback exists
-  },
-  "error": null                      // null or error string
+    "codex": {
+      "timestamp": 1711882804000,
+      "source": "codex_app_server",
+      "auth": {
+        "account_type": "chatgpt",
+        "plan_type": "plus"
+      },
+      "limits": {
+        "limit_id": "codex",
+        "primary": {
+          "utilization_pct": 19,
+          "resets_at": 1711890000,
+          "window_minutes": 300
+        },
+        "secondary": {
+          "utilization_pct": 44,
+          "resets_at": 1712300000,
+          "window_minutes": 10080
+        },
+        "credits": {
+          "has_credits": true,
+          "unlimited": false,
+          "balance": "141.86"
+        }
+      },
+      "error": null
+    }
+  }
 }
 ```
 
@@ -184,15 +227,14 @@ The tool writes `~/.claude/usage-data.json` with this schema:
 
 | Path | Type | Description |
 |------|------|-------------|
-| `version` | `number` | Always `1`. Check before parsing. |
+| `version` | `number` | Current schema version is `2`. |
 | `timestamp` | `number` | Unix ms. Data older than 5 min is stale. |
-| `limits.five_hour.utilization_pct` | `number` | Session usage 0-100% |
-| `limits.five_hour.resets_at` | `number` | Unix epoch seconds |
-| `limits.seven_day.utilization_pct` | `number` | Weekly usage 0-100% |
-| `limits.status` | `string` | Overall rate limit status |
-| `limits.overage.status` | `string` | Extra usage status |
-| `auth.rate_limit_tier` | `string` | Subscription tier |
-| `error` | `string\|null` | Error if fetch failed |
+| `providers.<name>.limits.primary.utilization_pct` | `number` | Raw primary window usage 0-100% |
+| `providers.<name>.limits.primary.resets_at` | `number` | Unix epoch seconds |
+| `providers.<name>.limits.secondary.utilization_pct` | `number` | Secondary window usage 0-100% |
+| `providers.claude.auth.rate_limit_tier` | `string` | Claude subscription tier |
+| `providers.codex.auth.plan_type` | `string` | Codex ChatGPT plan |
+| `providers.<name>.error` | `string\|null` | Error if provider refresh failed |
 
 ## Build on top of it
 
@@ -203,15 +245,15 @@ See [INTEGRATIONS.md](INTEGRATIONS.md) for the full integration guide — JSON s
 ## Requirements
 
 - macOS or Linux
-- Claude Code installed and logged in (`claude /login`)
-- macOS: reads OAuth token from Keychain automatically
-- Linux: Keychain access requires `security` CLI (macOS only for now — Linux support for credential storage is planned)
+- Claude Code installed and logged in (`claude /login`) if you want Claude data
+- Codex installed and logged in with ChatGPT if you want Codex data
+- macOS: Claude auth is read from Keychain automatically
 
 ## How it authenticates
 
-It reads the OAuth access token that Claude Code stores in your macOS Keychain (service: `Claude Code-credentials`). No credentials are stored, copied, or transmitted by this tool — it reads from Keychain on every call and sends the token directly to `api.anthropic.com`.
+Claude auth is read from the macOS Keychain (service: `Claude Code-credentials`) and used for a minimal Anthropic API call.
 
-The 1-token Haiku call exists only to trigger the API to return rate limit headers. The actual response content is discarded.
+Codex usage is read from your local Codex installation via Codex's local app-server interface, with recent local session data as a fallback if needed.
 
 ## Uninstall
 

@@ -1,5 +1,7 @@
 # Integrating with claude-usage
 
+> Note: the current CLI writes schema version 2 and can include both `claude` and `codex` providers. Claude data comes from Anthropic headers. Codex data comes from the local Codex app-server, with recent local session data as fallback. The examples below still focus on the original Claude-only shape and need a full refresh.
+
 This document explains how to integrate with `claude-usage` in your own tools, scripts, or AI workflows. You can paste this entire document into an AI assistant's context to give it everything it needs to build an integration.
 
 ## Overview

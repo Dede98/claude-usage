@@ -224,7 +224,15 @@ func guardTick(cfg *guardConfig, state *guardState) {
 		return
 	}
 
-	age := float64(time.Now().UnixMilli()-data.Timestamp) / 1000
+	providerName, provider := guardProvider(data)
+	if provider == nil {
+		if !cfg.quiet {
+			fmt.Printf("%s%s  no provider data%s", clearLine, colorDim, colorReset)
+		}
+		return
+	}
+
+	age := float64(time.Now().UnixMilli()-provider.Timestamp) / 1000
 	if age > 300 {
 		if !cfg.quiet {
 			fmt.Printf("%s%s  stale (%.0fs old)%s", clearLine, colorDim, age, colorReset)
@@ -232,12 +240,12 @@ func guardTick(cfg *guardConfig, state *guardState) {
 		return
 	}
 
-	if data.Error != nil || data.Limits == nil {
+	if provider.Error != nil || provider.Limits == nil {
 		return
 	}
 
-	pct, resetAt, windowName := bindingConstraint(data)
-	summary := usageSummary(data)
+	pct, resetAt, windowName := bindingConstraint(provider)
+	summary := usageSummary(providerName, provider)
 
 	if state.Paused {
 		if pct < cfg.warn {
@@ -299,16 +307,16 @@ func guardTick(cfg *guardConfig, state *guardState) {
 }
 
 // usageSummary returns a compact line showing both session and weekly usage.
-func usageSummary(data *UsageData) string {
+func usageSummary(name string, provider *ProviderSnapshot) string {
 	var parts []string
 
-	if data.Limits.FiveHour != nil && data.Limits.FiveHour.UtilizationPct != nil {
-		pct := *data.Limits.FiveHour.UtilizationPct
+	if provider.Limits.Primary != nil && provider.Limits.Primary.UtilizationPct != nil {
+		pct := *provider.Limits.Primary.UtilizationPct
 		c := pctColor(pct)
 		bar := progressBar(pct, 10)
-		s := fmt.Sprintf("%s%s %d%%%s 5h", c, bar, pct, colorReset)
-		if data.Limits.FiveHour.ResetsAt != nil {
-			r := resetCountdown(*data.Limits.FiveHour.ResetsAt)
+		s := fmt.Sprintf("%s%s %d%%%s %s", c, bar, pct, colorReset, providerWindowLabel(name, provider.Limits.Primary, 0))
+		if provider.Limits.Primary.ResetsAt != nil {
+			r := resetCountdown(*provider.Limits.Primary.ResetsAt)
 			if r != "" {
 				s += fmt.Sprintf(" %s%s%s", colorDim, r, colorReset)
 			}
@@ -316,13 +324,13 @@ func usageSummary(data *UsageData) string {
 		parts = append(parts, s)
 	}
 
-	if data.Limits.SevenDay != nil && data.Limits.SevenDay.UtilizationPct != nil {
-		pct := *data.Limits.SevenDay.UtilizationPct
+	if provider.Limits.Secondary != nil && provider.Limits.Secondary.UtilizationPct != nil {
+		pct := *provider.Limits.Secondary.UtilizationPct
 		c := pctColor(pct)
 		bar := progressBar(pct, 10)
-		s := fmt.Sprintf("%s%s %d%%%s 7d", c, bar, pct, colorReset)
-		if data.Limits.SevenDay.ResetsAt != nil {
-			r := resetCountdown(*data.Limits.SevenDay.ResetsAt)
+		s := fmt.Sprintf("%s%s %d%%%s %s", c, bar, pct, colorReset, providerWindowLabel(name, provider.Limits.Secondary, 1))
+		if provider.Limits.Secondary.ResetsAt != nil {
+			r := resetCountdown(*provider.Limits.Secondary.ResetsAt)
 			if r != "" {
 				s += fmt.Sprintf(" %s%s%s", colorDim, r, colorReset)
 			}
@@ -346,18 +354,22 @@ func runGuardStatus(cfg guardConfig) {
 		os.Exit(1)
 	}
 
-	if data.Error != nil {
-		printError(*data.Error)
+	name, provider := guardProvider(data)
+	if provider == nil {
+		fmt.Printf("%sNo limit data.%s\n", colorDim, colorReset)
+		os.Exit(0)
+	}
+	if provider.Error != nil {
+		printError(*provider.Error)
 		os.Exit(1)
 	}
-
-	if data.Limits == nil {
+	if provider.Limits == nil {
 		fmt.Printf("%sNo limit data.%s\n", colorDim, colorReset)
 		os.Exit(0)
 	}
 
 	fmt.Println()
-	fmt.Printf("  %s\n", usageSummary(data))
+	fmt.Printf("  %s\n", usageSummary(name, provider))
 
 	state := loadGuardState(cfg.stateFile)
 	if state.PauseCount > 0 {
@@ -373,31 +385,44 @@ func runGuardStatus(cfg guardConfig) {
 
 // ── Helpers ────────────────────────────────────────────────────────
 
-func bindingConstraint(data *UsageData) (int, float64, string) {
+func bindingConstraint(provider *ProviderSnapshot) (int, int64, string) {
 	var pct int
-	var resetAt float64
+	var resetAt int64
 	var name string
 
-	if data.Limits.FiveHour != nil && data.Limits.FiveHour.UtilizationPct != nil {
-		pct = *data.Limits.FiveHour.UtilizationPct
-		name = "session (5h)"
-		if data.Limits.FiveHour.ResetsAt != nil {
-			resetAt = *data.Limits.FiveHour.ResetsAt
+	if provider.Limits.Primary != nil && provider.Limits.Primary.UtilizationPct != nil {
+		pct = *provider.Limits.Primary.UtilizationPct
+		name = providerWindowLabel("guard", provider.Limits.Primary, 0)
+		if provider.Limits.Primary.ResetsAt != nil {
+			resetAt = *provider.Limits.Primary.ResetsAt
 		}
 	}
 
-	if data.Limits.SevenDay != nil && data.Limits.SevenDay.UtilizationPct != nil {
-		weeklyPct := *data.Limits.SevenDay.UtilizationPct
+	if provider.Limits.Secondary != nil && provider.Limits.Secondary.UtilizationPct != nil {
+		weeklyPct := *provider.Limits.Secondary.UtilizationPct
 		if weeklyPct > pct {
 			pct = weeklyPct
-			name = "weekly (7d)"
-			if data.Limits.SevenDay.ResetsAt != nil {
-				resetAt = *data.Limits.SevenDay.ResetsAt
+			name = providerWindowLabel("guard", provider.Limits.Secondary, 1)
+			if provider.Limits.Secondary.ResetsAt != nil {
+				resetAt = *provider.Limits.Secondary.ResetsAt
 			}
 		}
 	}
 
 	return pct, resetAt, name
+}
+
+func guardProvider(data *UsageSnapshot) (string, *ProviderSnapshot) {
+	if data == nil {
+		return "", nil
+	}
+	if provider := dProvider(data, "claude"); provider != nil {
+		return "claude", provider
+	}
+	if provider := dProvider(data, "codex"); provider != nil {
+		return "codex", provider
+	}
+	return "", nil
 }
 
 func resolvePID(cfg guardConfig) int {
